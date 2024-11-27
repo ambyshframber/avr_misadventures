@@ -1,0 +1,3 @@
+#!/bin/sh
+
+/home/ajal/.arduino15/packages/MiniCore/tools/avrdude/7.1-arduino.1/bin/avrdude -C/home/ajal/.arduino15/packages/MiniCore/hardware/avr/2.2.2/avrdude.conf -v -patmega328P -carduino -P/dev/ttyUSB0 -b115200 -D -Uflash:w:$1

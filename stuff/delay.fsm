@@ -1,0 +1,107 @@
+DECIMAL
+
+(
+	spin for 4N + 4 cycles, plus call overhead
+	4N + 7 for RCALL, 4N + 8 for CALL
+
+	1 cycle = 62.5ns at 16MHz
+		= 125ns at 8MHz
+	
+	N + 1 delay units, where a delay unit is 4 cycles
+	
+	4 cycles 	= 250ns at 16Mhz
+		 	= 500ns at 8Mhz
+)
+: SPIN
+	BEGIN
+		NOP
+		16 DEC
+	ZF SET UNTIL
+	NOP
+;
+(
+	spin for 1024N + 8 cycles, plus call overhead
+
+	256N + 2 delay units
+)
+: SPIN2
+	17 PUSH
+	16 17 MOV
+	BEGIN
+		253 16 LDI
+		SPIN 
+		NOP
+		17 DEC
+	ZF SET UNTIL
+	17 POP
+;
+(
+	spin for 262144N + 8 cycles, plus call overhead
+
+	65536N + 2 du
+)
+: SPIN3
+	18 PUSH
+	16 18 MOV
+	BEGIN
+		255 16 LDI \ 1
+		SPIN2 \ 0x3F008 cycles + 3 cycles
+
+		250 16 LDI \ 1
+		SPIN \ 4N + 4 + 3 cycles
+
+		NOP \ 1
+		18 DEC \ 1
+		
+		\ 16 + 0x3FC04 + 4N
+		\ = 3FC14
+		\ 4N = 1000
+	ZF SET UNTIL \ 2
+	18 POP
+;
+
+{
+	: >DU ( ns -- du )
+		CPU_MHZ * 4000 /MOD SWAP 0<> +
+		?DUP UNLESS 1 THEN \ minimum of 1 delay unit
+	;
+	: USEC 1000 * ;
+	: MSEC 1000000 * ;
+
+	: DELAY ( ns -- )
+		\DUP ." delay " U. ." ns" CR
+		
+		>DU
+
+		\DUP ." =" U. ." du" CR
+
+		\16 {} PUSH
+		DUP 257 U<= IF
+			\ 257 DU or less, SPIN
+			\." call SPIN" CR
+			1- 1 MAX 255 AND 16
+			{} LDI {} SPIN
+		ELSE
+			DUP 65537 U<= IF
+				\ SPIN2
+				\." call SPIN2 "
+				8 >> 255 AND
+				\DUP . CR
+				16 {} LDI {} SPIN2
+			ELSE
+				\ SPIN3
+				\." call SPIN3 "
+				16 >> 255 AND
+				\DUP . CR
+				16 {} LDI {} SPIN3
+			THEN
+		THEN
+
+		\16 {} POP
+	;
+	: DELAY_SAVE_R16
+		16 {} PUSH
+		DELAY
+		16 {} POP
+	;
+}

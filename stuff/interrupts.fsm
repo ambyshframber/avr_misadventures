@@ -1,0 +1,103 @@
+LOAD ../m328P.def
+
+INT_VECTORS_SIZE BRESV
+
+DECIMAL
+
+RSVARIABLE MILLIS
+
+(
+	NOTE ON REGISTERS ------------
+
+	r0 through 3 inclusive are reserved as ISR scratches
+)
+
+: OC0AISR
+	24 2 MOVW
+	SREG 0 IN
+
+	MILLIS 24 LDSW
+	H# 9601 B, \ 1 24 ADIW
+	24 MILLIS STS
+	25 MILLISH STS
+
+	0 SREG OUT
+	2 24 MOVW
+I;
+' OC0AISR OC0Aaddr V!
+
+: INIT_T0
+	(
+		T0 is clocked at F_CPU / 64 and resets every 250 clocks.
+		This creates F_OC0A at 1khz.
+	)
+	250 OCR0A OUTI
+	B# 10 TCCR0A OUTI \ CTC mode
+	B# 11 TCCR0B OUTI \ F_CPU / 64
+	B# 10 TIMSK0 STSI \ send interrupts from compare match A to cpu
+;
+
+: INIT_UART
+	\ init uart to 19k2 baud
+	51 UBRR0L STSI
+	0 UBRR0H STSI
+
+	{ 1 RXEN0 << } UCSR0B STSI
+;
+
+: EMIT
+	BEGIN
+		UCSR0A 17 LDS
+		17 UDRE0 SET STBR
+	AGAIN
+
+	16 UDR0 STS
+;
+
+: TDELAY
+	LOCK
+		MILLIS 4 LDS
+		MILLISH 5 LDS
+	UNLOCK
+	4 16 ADD
+	5 17 ADC
+
+	BEGIN
+		B# 1 SMCR OUTI
+		SLEEP
+
+		LOCK
+			MILLIS 4 LDS
+			MILLISH 5 LDS
+		UNLOCK
+		4 16 CP
+		5 17 CPC
+	ZF SET UNTIL
+;
+
+: RESET
+	\ init stack pointer
+	-1 SPL OUTI
+	16 SPH OUT
+
+	INIT_T0
+	INIT_UART
+
+	GIF SEF
+
+	DDRB 5 SBI
+	\PORTB 5 SBI
+
+	BEGIN
+		1000 16 LDIW
+		TDELAY
+		PORTB 5 SBI
+		1000 16 LDIW
+		TDELAY
+		PORTB 5 CBI
+	AGAIN
+
+' RESET RESET!
+
+FINISH
+

@@ -1,0 +1,185 @@
+LOAD ../m328P.def
+
+DECIMAL
+
+(
+	REGISTER ALLOCATION
+
+	[2,3]	reserved for ISRs
+
+	6	serial rx buf head (write)
+	7	serial rx buf tail (read)
+
+	[8,9]	milliseconds since reset
+			little endian
+			access with MOVW or inside a lock
+
+	[22,23]	reserved for ISRs
+	[24,25] TOS
+
+	X	forth execution pointer (FIP)
+	Y	data stack, full descending
+	Z	general purpose pointer (clobbered by NEXT)
+
+	SP	return stack, empty descending
+
+	T flag	execution state (NOT compiler state)
+
+
+	Y is used for the data stack because AVR already wants to use the hardware stack as a return stack (ie. for call and return instructions). I checked the datasheet, STY- and LDY+ are the same speed as PUSH and POP respectively.
+
+	This Forth is little-endian with descending stacks, so high-order bytes are pushed first and popped last.
+
+
+	A NOTE ON NOMENCLATURE
+
+	In this program, the term "word" is used to mean a Forth function, such as DROP, SWAP, EMIT etc etc. To avoid confusion, a 16-bit number is called a "cell" and is abbreviated to S (for Short). An 8-bit number is called a "byte" and is abbreviated to C (for Character). TODO: make this clearer
+)
+
+$
+9 BALIGN \ 256-cell aligned cuz reasons
+$ SWAP - . ." cells wasted on alignment" CR
+
+$ CONSTANT JTABLE
+
+256 BRESV
+
+R: NEXT
+	TF CLEAR IF	\ executing from flash
+		X Z MOVW
+		1 X ADIW
+		Z LPM
+		JTABLE HIBYTE ZH LDI	\ table must be 256-cell aligned
+		Z LSL
+		IJMP
+	THEN
+
+	JTABLE HIBYTE ZH LDI
+	Z LDX+
+	Z LSL
+	IJMP
+
+
+: FDOCOL
+	\ address of first forth token is on the return stack
+	16 POP
+	17 POP
+
+	XH PUSH
+	X PUSH
+
+	16 X MOVW
+	TF CLF
+
+	NEXT
+
+(
+	DICTIONARY STRUCTURE
+
+	There are two dictionaries in this Forth: one in flash, one in RAM. They have slightly different structures.
+
+	The flash dictionary is structured as follows:
+
+	+----------+----------+-------------+----------------------+
+	| padding? | name ... | len + flags | AVR machine code ... |
+	+----------+----------+-------------+----------------------+
+					      ^ jump table entry points here
+
+	We don't need a link field because the dictionary isn't a linked list: we iterate over the jump table to get word addresses. To make sure accessing the name is at least slightly simple, we put the padding byte at the start so we don't have to mess about with extra subtractions if the name has an even length. Strictly speaking the padding byte isn't part of the header, and is actually padding to align the header properly, but I included it here so it's easier to understand the macro.
+
+	The RAM dictionary is structured like this:
+
+	+----------+-------------+------------------+
+	| name ... | len + flags | Forth tokens ... |
+	+----------+-------------+------------------+
+				   ^ jump table entry points here
+
+	As with the flash dictionary, there is no link field, because we get addresses from the RAM portion of the jump table. There's also no padding byte because (unlike the AVR machine code in flash) RAM has no alignment requirements.
+)
+
+(
+	WORDS --------------------------------
+
+	DROP
+	DUP
+	?DUP
+
+	SWAP
+	OVER
+	ROT
+	-ROT
+
+	1+
+	1-
+	2+
+	2-
+
+	+
+	-
+
+	AND
+	OR
+	XOR
+	INVERT
+
+	SHR
+	SHL
+	LSHL
+
+	=
+	<>
+	NOT
+	
+	>
+	<
+
+	U>
+	U<
+
+	EXIT
+	LIT
+	CLIT
+
+	BRANCH
+	0BRANCH
+
+	!
+	@
+
+	OUT
+	IN
+	
+	+!
+	-!
+
+	C!
+	C@
+
+	DEC
+	HEX
+
+	KEY
+	KEY?
+
+	EMIT
+
+	U.R
+	.R
+	.
+
+	SEB
+	CLB
+	B!
+	B@
+
+
+	CONSTANTS --------------------------------
+
+	HERE
+	BASE
+
+	DDR{B,C,D}
+	PORT{B,C,D}
+	PIN{B,C,D}
+	
+)

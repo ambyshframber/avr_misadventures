@@ -1,0 +1,338 @@
+LOAD ../m328P.def
+
+INT_VECTORS_SIZE BRESV
+
+DECIMAL
+
+(
+	REGISTER ALLOCATION ------------
+
+	r[2,5]	ISR scratch
+	r[6,7]	milliseconds since reset
+			little endian
+			do not access outside of lock except with MOVWs
+
+	TIMER ALLOCATION ------------
+
+	t0	millisecond timer
+	t1	16-bit pwm
+)
+
+6 CONSTANT MILLIS
+7 CONSTANT MILLISH
+
+: OC0AISR
+	SREG 2 IN
+
+	MILLIS INC
+	ZF SET IF
+		MILLISH INC
+	THEN
+
+	2 SREG OUT
+I;
+' OC0AISR OC0Aaddr V!
+
+: INIT_T0
+	(
+		T0 is clocked at F_CPU / 64 (ie. 250khz) and resets every 250 clocks.
+		This creates F_OC0A at 1khz.
+	)
+	250 OCR0A OUTI		\ TOP = 250
+	B# 01000010 TCCR0A OUTI 	\ CTC mode, toggle OC0A on compare match
+	B# 11 TCCR0B OUTI 	\ F_CPU / 64
+	B# 10 TIMSK0 STSI 	\ send interrupts from compare match A to cpu
+;
+
+: INIT_T1
+	(
+		T1 is clocked at F_CPU / 8 and resets every 1024 clocks. This creates a PWM freqency of just under 2khz.
+	)
+	B# 10100011 TCCR1A STSI \ OC1A and B enabled, 10 bit phase correct PWM
+	B# 10 TCCR1B STSI 	\ F_CPU / 8
+;
+
+(
+: TDELAY
+	LOCK
+		MILLIS 16 ADD
+		MILLISH 17 ADC
+	UNLOCK
+
+	BEGIN
+		B# 1 18 LDI
+		18 SMCR OUTI
+		SLEEP
+
+		LOCK
+			MILLIS 16 CP
+			MILLISH 17 CPC
+		UNLOCK
+	ZF SET UNTIL
+;
+)
+
+(
+	struct channel {
+		u8 mode;
+		u8 output;
+		u16 freq;
+		u16 phase;
+		u16 iphase;
+		[u16; 4] params;
+	}
+
+	for non-pwm modes, output is a bitmask over port d
+	for pwm modes, output selects t1 pwm channel
+
+	MODES:
+		0	off
+		1	pulse wave
+			params[0] = pulse width
+		2	ramp pwm
+		3	cosine pwm
+)
+
+16 CONSTANT CHAN_SIZE
+
+R: OUT_MODE1 ( y: &ch, [10,11]: phase )
+	8 8 LDDYW \ pulse width
+	1 17 LDDY \ bitmask
+	PORTD 18 IN
+	
+	8 10 CP
+	9 11 CPC
+	\ cf set if pw > ph
+	CF SET IF
+		17 18 OR \ set outputs
+	ELSE
+		17 NEG 17 DEC
+		17 18 AND
+	ETHEN
+	18 PORTD OUT
+;
+
+R: OUT_MODE2
+	1 17 LDDY \ pwm channel
+	12 CLR
+
+	\ calculate ramp value = (phase >> 6) & 0x3ff
+	\ which also = hi10(phase << 2)
+
+	10 LSL
+	11 ROL
+	12 ROL
+
+	10 LSL
+	11 ROL
+	12 ROL
+
+	\ pwm value is in [11,12]
+	17 TST
+	ZF SET IF
+		11 OCR1AL STSW
+		RET
+	THEN
+	11 OCR1BL STSW
+;
+
+(
+	COSINE LOOKUP TABLE
+
+	This contains the first half of a cosine wave (ie. 0<=idx<256 maps from 0<=x<pi). Values past 0xB0 are multiplied by 4 for better pwm precision. TODO: make shift threshold automatically determined
+
+	Because this assembler has practically limitless macro support, I can do something silly here and directly place the lookup generation code in this file.
+)
+
+BHERE @ CONSTANT COS_LUT
+
+{
+	INCLUDELIB float.f
+	: GEN_LUT
+		255 BC, \ cos(0) = 1, which obviously we can't have in the table because 1Q0.8 = 256 = 0u8
+		1
+		BEGIN DUP 256 < WHILE
+			DUP DUP
+
+			\ first, generate the first half of cosine, shifted and scaled
+			I>X [ 256.0 FPI F/ ]X, XF/ 	\ map [0,256) to [0,pi)
+			XFCOS X1. XF+ XF2/		\ take cosine, then shift/scale to be within 0,1
+			XFSQUARE
+
+			H# 80 >= IF
+				XF2* XF2*
+			THEN
+
+			\ then, convert back to Q0.8
+			[ 256.0 ]X, XF* X>IT
+			\SWAP HEX 2 U.R SPACE DUP 8 BIN U.R DEC CR
+			BC,
+
+			1+
+		REPEAT
+	;
+
+	GEN_LUT
+}
+
+R: OUT_MODE3 ( y: &ch, [10,11]: phase )
+	\ generate index from phase
+	\ bit 15 = which half of wave
+	\ bits [14,7] = index
+	11 16 MOV
+
+	10 LSL
+	11 ROL
+
+	\ 11 contains index
+	\ if 16[7], flip
+
+	B# 10000000 16 ANDI
+	ZF CLEAR IF \ flip index
+		PORTB 3 SBI
+		11 NEG
+		11 DEC
+	THEN
+
+	COS_LUT Z LDIW
+	11 Z ADD
+	CF SET IF
+		ZH INC	\ LUT doesn't need to be aligned!!!
+	THEN
+	10 LPM
+	11 16 MOV
+	11 CLR
+
+	\ for indexes < 0x80, shift pwm value 2 left
+	H# 80 16 CPI
+	CF SET IF
+		10 LSL
+		11 ROL
+		10 LSL
+		11 ROL
+	THEN
+
+	\ pwm value is in [10,11]
+	1 16 LDDY \ pwm channel
+	16 TST
+	ZF SET IF
+		10 OCR1AL STSW
+		RET
+	THEN
+	10 OCR1BL STSW
+;
+
+(
+	THE MYSTERY BITSHIFT EXPLAINED
+
+	We're using T1 for our PWM output, which means we have a choice of 8, 9, or 10-bit precision. Logically you'd think using anything more than 8 bits of precision would mean doubling the size of the lookup table, but with some cleverness we can get two more bits out of nowhere. Basically, for values past a certain point on the cosine curve, the two high order bits are always clear, which means we can multiply the value by 4 before casting it back to an int and it'll still fit in 8 bits. This means that for all values before that point, we need to shift them left by two after getting the value from the table. We still only have 8 bits in the lookup table, but we can use 10-bit PWM.
+
+	In slightly more rigorous terms, the first section of the lookup table is stored as Q0.8 and the second section is stored as Q0.10. The bitshift is to convert Q0.8 to Q0.10 (or strictly speaking Q6.10, because we're on a byte oriented machine).
+
+	TODO: ascii art diagram
+
+	SECOND TODO: don't do it like this - instead do the curve in software using another lut. allows for generating percieved brightness on the fly
+)
+
+$ CONSTANT OUT_JTABLE
+	RET
+	OUT_MODE1
+	OUT_MODE2
+	OUT_MODE3
+
+{
+	$ H# FF00 OUT_JTABLE H# FF00 <> IF ." jump table straddles boundary" THEN
+}
+
+: DO_CHAN ( y: &ch -- z: &ch, [10,11]: phase )
+	(
+		i am somewhat optimistically assuming here that each cycle will complete in less than a millisecond. if this turns out to not be true, i guess we're fucked.
+
+		REGISTERS:
+			[8,9]	frequency
+			[10,11]	phase
+
+			clobbers z
+	)
+
+	2 8 LDDYW
+	4 10 LDDYW
+
+	8 10 ADD
+	9 11 ADC
+
+	4 10 STDYW
+
+	OUT_JTABLE Z LDIW
+	8 LDY
+	8 Z ADD
+	IJMP
+	\ i'm a god damned genius!
+
+
+
+1 CONSTANT #CHANNELS
+CHAN_SIZE #CHANNELS * RALLOT CONSTANT CHANNELS
+
+BHERE @ CONSTANT CH0_F \ BYTE ADDRESS
+
+3 BC, B# 0 BC, \ d3
+50 B,
+0 B,
+0 B,
+H# 1000 B,
+3 BRESV
+
+1 BC, B# 100 BC, \ d2
+107 B,
+0 B,
+0 B,
+H# 1000 B,
+3 BRESV
+
+
+: PM>X
+	BEGIN
+		17 LPM+
+		17 STX+
+		16 DEC
+	ZF SET UNTIL
+;
+
+: RESET
+	\ init stack pointer
+	-1 SPL OUTI
+	16 SPH OUT
+
+	B# 11111100 DDRD OUTI
+
+	B# 1111 DDRB OUTI
+
+	CH0_F Z LDIW
+	CHANNELS X LDIW
+	#CHANNELS CHAN_SIZE * 16 LDI
+	PM>X
+
+	INIT_T0
+	INIT_T1
+
+	GIF SEF
+
+	CHANNELS Y LDIW
+	BEGIN
+		PORTB 0 SBI
+		B# 1 SMCR OUTI
+		SLEEP
+		PORTB 0 CBI
+		
+		(
+			check if interrupt was rx or timer
+			if rx, stop updating lights while handling the command
+		)
+
+		DO_CHAN
+	AGAIN
+
+' RESET RESET!
+
+FINISH

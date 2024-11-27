@@ -1,0 +1,467 @@
+LOAD ../m328P.def
+
+DECIMAL
+
+(
+	REGISTER ALLOCATION
+
+	[2,5]	reserved for ISRs
+
+	6	serial rx buf head (write)
+	7	serial rx buf tail (read)
+
+	[8,9]	milliseconds since reset
+			little endian
+			access with MOVW or inside a lock
+
+
+	[24,25] TOS
+
+	X	forth execution pointer (FIP)
+	Y	data stack, full descending
+	Z	general purpose pointer (clobbered by NEXT)
+
+	SP	return stack, empty descending
+
+	Y is used for the data stack because AVR already wants to use the hardware stack as a return stack (ie. for call and return instructions). I checked the datasheet, STY- and LDY+ are the same speed as PUSH and POP respectively.
+
+	This Forth is little-endian with descending stacks, so high-order bytes are pushed first and popped last.
+
+
+	A NOTE ON NOMENCLATURE
+
+	In this program, the term "word" is used to mean a Forth function, such as DROP, SWAP, EMIT etc etc. To avoid confusion, a 16-bit number is called a "cell" and is abbreviated to S (for Short). An 8-bit number is called a "byte" and is abbreviated to C (for Character). TODO: make this clearer
+
+
+	SRAM ALLOCATION
+
+	0 	uart rx buf
+	16	HERE
+	18	LATEST
+	20	STATE
+	22	BASE
+)
+
+{
+	6 CONSTANT RXBH
+	7 CONSTANT RXBT
+
+	8 CONSTANT MILLIS
+	9 CONSTANT MILLISH
+	
+	24 CONSTANT TOS
+	25 CONSTANT TOSH
+	X CONSTANT FIP
+	Y CONSTANT DSP
+
+	: DPUSH DUP 1+ {} STY- {} STY- ;
+	: DPOP DUP {} LDY+ 1+ {} LDY+ ;
+}
+
+INT_VECTORS_SIZE BRESV
+
+(
+	BITS AND BOBS
+
+	I'm gonna shove some ISRs and other miscellaneous underneath-forth stuff here to fill the alignment gap before the jump table.
+)
+
+: OC0AISR
+	SREG 2 IN
+
+	MILLIS INC
+	ZF SET IF
+		MILLISH INC
+	THEN
+
+	2 SREG OUT
+I;
+' OC0AISR OC0Aaddr V!
+
+: INIT_T0
+	(
+		T0 is clocked at F_CPU / 64 (ie. 250khz) and resets every 250 clocks.
+		This creates F_OC0A at 1khz.
+	)
+	250 OCR0A OUTI		\ TOP = 250
+	B# 10 TCCR0A OUTI 	\ CTC mode
+	B# 11 TCCR0B OUTI 	\ F_CPU / 64
+	B# 10 TIMSK0 STSI 	\ send interrupts from compare match A to cpu
+;
+
+16 RALLOT CONSTANT RX_BUF
+
+: RXCISR
+	SREG 2 IN
+	16 PUSH
+	17 PUSH
+
+	UDR0 16 LDS
+
+	\ if head = tail, buffer is empty
+	\ if head + 1 = tail, buffer is full
+	RXBH 3 MOV	\ calculate head + 1
+	3 INC
+	H# F 17 LDI
+	16 3 AND
+	3 RXBT CP	\ compare to tail
+	ZF CLEAR IF 	\ buffer not full
+		Z DPUSH
+		
+		RX_BUF HIBYTE ZH LDI
+		RXBH Z MOV
+		16 STZ
+
+		3 RXBH MOV	\ we already calculated head + 1 earlier
+
+		Z DPOP
+	THEN
+
+	17 POP
+	16 POP
+	2 SREG OUT
+I;
+
+: KEY?
+	LOCK
+		RXBH RXBT CP
+		ZF CLEAR IF
+			RX_BUF HIBYTE ZH LDI
+			RXBT Z MOV
+			TOS DPUSH
+			TOS LDZ
+			TOSH CLR
+			RXBT INC
+
+			H# F 16 LDI
+			16 RXBT AND
+			ZF SEF
+			RET
+		THEN
+		ZF CLF
+	UNLOCK
+;
+
+: KEY
+	BEGIN
+		KEY?
+		ZF SET IF
+			RET
+		THEN
+
+		B# 1 SMCR OUTI	\ wait for an interrupt before checking again
+		SLEEP
+		\ even if a char arrives between checking the buffer and this wait, it's ok
+		\ because we have interrupts firing every millisecond anyway
+	AGAIN
+;
+
+: INIT_UART
+	\ init uart to 9600 baud
+	103 UBRR0L STSI
+	0 UBRR0H STSI
+
+	B# 10011000 UCSR0B STSI \ enable rx complete interrupt, enable rx and tx
+;
+
+(
+	THE JUMP TABLE
+
+	The core of a token threaded Forth is some kind of mapping that matches tokens to code. In our case, we use a jump table. Each entry is a one-word RJMP instruction, so rather than getting an address from the table and jumping to that address, we can literally just jump into the table and jump right back out again.
+)
+
+$
+9 BALIGN \ 256-cell aligned cuz reasons
+$ SWAP - . ." cells wasted on alignment" CR
+
+$ CONSTANT JTABLE
+
+256 BRESV
+(
+	Slight hack here: all defineable word slots are present in the table and are all set to a word that does the Relevant Stuff to call a Forth word (see: DOCOL).
+)
+
+\ This is NEXT. Note that we use R: instead of :, because NEXT is a routine, not a subroutine. This means it should be jumped to rather than called.
+
+R: NEXT
+	JTABLE HIBYTE ZH LDI
+	Z LDX+
+	IJMP
+
+
+(
+	Design constraint: all words need to be within 4K in either direction of the jump table, because it's designed around 1-cell entries (ie. RJMP).
+
+	Note to self: if this doesn't work out, consider loading the address from the table *then* IJMPing. ALSO preserve ZL, because DOCOL needs it.
+)
+
+(
+	DICTIONARY STRUCTURE
+
+	There are two dictionaries in this Forth: one in flash, one in RAM. They have slightly different structures.
+
+	The flash dictionary is structured as follows:
+
+	+----------+----------+-------------+----------------------+
+	| padding? | name ... | len + flags | AVR machine code ... |
+	+----------+----------+-------------+----------------------+
+					      ^ jump table entry points here
+
+	We don't need a link field because the dictionary isn't a linked list: we iterate over the jump table to get word addresses. To make sure accessing the name is at least slightly simple, we put the padding byte at the start so we don't have to mess about with extra subtractions if the name has an even length. Strictly speaking the padding byte isn't part of the header, and is actually padding to align the header properly, but I included it here so it's easier to understand the macro.
+
+	The RAM dictionary is structured like this:
+
+	+----------+-------------+------------------+
+	| name ... | len + flags | Forth tokens ... |
+	+----------+-------------+------------------+
+				   ^ jump table entry points here
+
+	As with the flash dictionary, there is no link field, because we get addresses from the RAM portion of the jump table. There's also no padding byte because (unlike the AVR machine code in flash) RAM has no alignment requirements.
+)
+
+{
+	VARIABLE #CODEDEFS \ number of code defs - useful later
+
+	: DEFCODE \ shoutout to jones
+		WORD DUP 1 AND UNLESS
+			\ if name length is even, add a padding byte
+			0 BC,
+		THEN
+
+		TUCK \ save length
+
+		BEGIN ?DUP WHILE
+			COUNT BC,
+		REPEAT
+		DROP
+
+		BC, \ compile length
+
+		\ AVR machine code follows from this point
+
+		$
+		#CODEDEFS @ JTABLE +
+
+		( to from )
+
+		TUCK (RJMP) SWAP 2*
+		B0 + S!
+
+		1 #CODEDEFS +!
+	;
+}
+
+(
+	You might expect me to define DOCOL at this point, but actually that comes later. In this Forth, DOCOL is only required for colon definitions in RAM. Likewise, I'm not going to define DEFWORD, because colon defs are only created at runtime.
+)
+
+DEFCODE DROP
+	TOS DPOP
+NEXT
+
+DEFCODE DUP
+	TOS DPUSH
+NEXT
+
+DEFCODE ?DUP
+	TOS TST
+	ZF CLEAR IF
+		TOSH TST
+		ZF CLEAR IF
+			TOS DPUSH
+		THEN
+	THEN
+NEXT
+
+DEFCODE SWAP
+	16 LDYW
+	TOS STYW
+	16 TOS MOVW
+NEXT
+
+DEFCODE OVER
+	16 LDYW
+	TOS DPUSH
+	16 TOS MOVW
+NEXT
+
+DEFCODE ROT
+	16 LDYW 	\ 2os
+	2 18 LDDYW 	\ 3os
+
+	2 16 STDYW	\ 2os -> 3os
+	TOS STYW	\ tos -> 2os
+	18 TOS MOVW	\ 3os -> tos
+NEXT
+
+DEFCODE -ROT
+	16 LDYW 	\ 2os
+	2 18 LDDYW 	\ 3os
+			\ 16 is tos
+			
+	2 TOS STDYW	\ tos -> 3os
+	18 STYW	\ 3os -> 2os
+	16 TOS MOVW	\ 2os -> tos
+NEXT
+
+DEFCODE 1+
+	1 TOS ADIW
+NEXT
+DEFCODE 1-
+	1 TOS SBIW
+NEXT
+
+DEFCODE 2+
+	2 TOS ADIW
+NEXT
+DEFCODE 2-
+	2 TOS SBIW
+NEXT
+
+DEFCODE +
+	16 DPOP
+	16 TOS ADD
+	17 TOSH ADC
+NEXT
+DEFCODE -
+	16 DPOP
+	TOS 16 SUB
+	TOSH 17 SBC
+	16 TOS MOVW
+NEXT
+
+DEFCODE 2*
+	TOS LSL
+	TOSH ROL
+NEXT
+DEFCODE 2/
+	TOSH ASR
+	TOS ROR
+NEXT
+DEFCODE U2/
+	TOSH LSR
+	TOS ROR
+NEXT
+
+\ mul and div can wait
+
+DEFCODE =
+	16 DPOP
+
+	16 TOS CP
+	17 TOSH CPC
+
+	0 TOSH LDI 	\ CLR clobbers flags because it's secretly xor in a funny hat
+	0 TOS LDI
+
+	ZF SET IF 	\ eq
+		1 TOS LDI
+	THEN
+NEXT
+
+\ the other comparisons can wait too
+
+DEFCODE EXIT
+	X POP
+	XH POP
+NEXT
+
+DEFCODE LIT
+	TOS LDX+
+	TOSH LDX+
+NEXT
+DEFCODE CLIT \ hoo hoo
+	TOS LDX+
+	TOSH CLR
+NEXT
+
+DEFCODE !
+	TOS Z MOVW
+	TOS DPOP
+	TOS STZW
+	TOS DPOP
+NEXT
+DEFCODE @
+	TOS Z MOVW
+	TOS LDZW
+NEXT
+
+DEFCODE +!
+	TOS Z MOVW
+	TOS DPOP
+	16 LDZW
+	16 TOS ADD
+	17 TOSH ADC
+	TOS STZW
+	TOS DPOP
+NEXT
+DEFCODE -!
+	TOS Z MOVW
+	TOS DPOP
+	16 LDZW
+	TOS 16 SUB
+	TOSH 17 SBC
+	16 STZW
+	TOS DPOP
+NEXT
+
+DEFCODE C!
+	TOS Z MOVW
+	TOS LDY		\ pop only low byte - saves a couple cycles
+	2 Y ADIW
+	TOS STZ
+	TOS DPOP
+NEXT
+DEFCODE C@
+	TOS Z MOVW
+	TOS LDZ
+	TOSH CLR
+NEXT
+
+{
+	: DEFCONST
+		DEFCODE
+		( val )
+		TOS DPUSH
+		DUP LOBYTE TOS {} LDI
+		HIBYTE TOSH {} LDI
+		{} NEXT
+	;
+}
+
+16 DEFCONST HERE
+
+#CODEDEFS ? ." code defs" CR
+
+256 #CODEDEFS @ - 2* RALLOT CONSTANT RJTABLE
+\ cannot straddle 256 byte boundary etc etc
+\ maximum 128 colon defs ie. minimum 128 code defs
+
+
+R: DOCOL
+	(
+		At this moment, ZL contains the Forth token. Or maybe it doesn't! Maybe RJMPing to every word isn't possible and NEXT needs to load from the table first. In that case, some other register contains the Forth token.
+	)
+	
+	RJTABLE HIBYTE ZH LDI
+	#CODEDEFS @ Z SUBI
+	Z LSL \ byte address not word address
+
+	XH PUSH
+	X PUSH
+
+	X LDZW
+
+	NEXT
+
+
+R: RESET
+	INIT_T0
+	INIT_UART
+
+	GIF SEF
+
+
+' RESET RESET!
+
+FINISH

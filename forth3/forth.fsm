@@ -1,0 +1,424 @@
+LOAD ../m328P.def
+
+DECIMAL
+
+INT_VECTORS_SIZE BRESV
+
+(
+	REGISTER ALLOCATION
+
+	[2,3]	reserved for ISRs
+
+	6	serial rx buf head (write)
+	7	serial rx buf tail (read)
+
+	[8,9]	milliseconds since reset
+			little endian
+			access with MOVW or inside a lock
+
+	[22,23]	reserved for ISRs
+	[24,25] TOS
+
+	X	forth execution pointer (FIP)
+	Y	data stack, full descending
+	Z	general purpose pointer (clobbered by NEXT)
+
+	SP	return stack, empty descending
+
+
+	Y is used for the data stack because AVR already wants to use the hardware stack as a return stack (ie. for call and return instructions). I checked the datasheet, STY- and LDY+ are the same speed as PUSH and POP respectively.
+
+	This Forth is little-endian with descending stacks, so high-order bytes are pushed first and popped last.
+
+
+	A NOTE ON NOMENCLATURE
+
+	In this program, the term "word" is used to mean a Forth function, such as DROP, SWAP, EMIT etc etc. To avoid confusion, a 16-bit number is called a "cell" and is abbreviated to S (for Short). An 8-bit number is called a "byte" and is abbreviated to C (for Character). TODO: make this clearer
+)
+
+{
+	2 CONSTANT IR0
+	3 CONSTANT IR1
+
+	6 CONSTANT RXBH
+	7 CONSTANT RXBT
+
+	8 CONSTANT MILLIS
+	9 CONSTANT MILLISH
+
+	22 CONSTANT IR2
+	23 CONSTANT IR3
+	
+	24 CONSTANT TOS
+	25 CONSTANT TOSH
+	X CONSTANT FIP
+	Y CONSTANT DSP
+
+	: DPUSH DUP 1+ {} STY- {} STY- ;
+	: DPOP DUP {} LDY+ 1+ {} LDY+ ;
+}
+
+(
+	BITS AND BOBS
+
+	I'm gonna shove some ISRs and other miscellaneous underneath-forth stuff here to fill the alignment gap before the jump table.
+)
+
+: OC0AISR
+	SREG 2 IN
+
+	MILLIS INC
+	ZF SET IF
+		MILLISH INC
+	THEN
+
+	2 SREG OUT
+I;
+' OC0AISR OC0Aaddr V!
+
+: INIT_T0
+	(
+		T0 is clocked at F_CPU / 64 (ie. 250khz) and resets every 250 clocks.
+		This creates F_OC0A at 1khz.
+	)
+	250 OCR0A OUTI		\ TOP = 250
+	B# 10 TCCR0A OUTI 	\ CTC mode
+	B# 11 TCCR0B OUTI 	\ F_CPU / 64
+	B# 10 TIMSK0 STSI 	\ send interrupts from compare match A to cpu
+;
+
+16 RALLOT CONSTANT RX_BUF
+
+: RXCISR
+	SREG IR0 IN
+
+	UDR0 IR2 LDS \ IR2 = data
+
+	\ if head = tail, buffer is empty
+	\ if head + 1 = tail, buffer is full
+	RXBH IR3 MOV	\ IR3 = head + 1
+	IR3 INC
+	H# F IR3 ANDI
+	IR1 RXBT CP	\ compare to tail
+	ZF CLEAR IF 	\ buffer not full
+		Z DPUSH
+		
+		RX_BUF HIBYTE ZH LDI
+		RXBH Z MOV
+		IR2 STZ
+
+		IR1 RXBH MOV	\ we already calculated head + 1 earlier
+
+		Z DPOP
+	THEN
+	IR0 SREG OUT
+I;
+
+(
+	TOKENS
+
+	There are words. Some number of these are builtins, some number are runtime-defined (technically not actually but shh).
+
+
+	DOCOL
+
+	before the jump table to save space after
+)
+
+{
+	VARIABLE #CODEDEFS	\ not really number of defs as much as it is cells used in table
+	SRAM_START H# 100 + CONSTANT RJTABLE
+}
+
+R: DOCOL
+	(
+		ZL contains word# << 1
+	)
+	\ subtract #builtins * 2
+	\ add lobyte of rjtable
+	\ load hibyte of rjtable into zh
+
+	RJTABLE HIBYTE ZH LDI
+	{ #CODEDEFS @ 2* RJTABLE LOBYTE - } Z SUBI	\ PATCH THIS LATER
+
+	XH PUSH
+	X PUSH
+
+	X LDZW
+
+	BHERE @ B0 + $
+	0 B, \ space for rjmp next
+
+
+$
+9 BALIGN \ 256-cell aligned cuz reasons
+$ SWAP - . ." cells wasted on alignment" CR
+
+$ CONSTANT JTABLE
+
+256 BRESV \ 256 cells = 128 long jumps
+(
+	Slight hack here: all defineable word slots are present in the table and are all set to a word that does the Relevant Stuff to call a Forth word (see: DOCOL).
+)
+
+R: NEXT
+	JTABLE HIBYTE ZH LDI
+	Z LDX+
+	IJMP
+
+' NEXT SWAP (ROUTINE) DROP SWAP S!
+
+(
+	THE DICTIONARY
+
+	Surprise! There isn't one. Well, there is, but not on the avr. 
+)
+
+{
+	: DEFCODE
+		#CODEDEFS ? WORD TELL CR
+
+		$ #CODEDEFS @ JTABLE + DUP B> -ROT ( from_buf to from )
+		\.S CR
+		(ROUTINE) ?DUP IF
+			\ long jump ( from_buf jmp to )
+			ROT TUCK 2 + S! S!
+			2 #CODEDEFS +!
+		ELSE
+			\ short jump ( from_buf rjmp )
+			\.S CR
+			SWAP S!
+			1 #CODEDEFS +!
+		THEN
+	;
+}
+
+DEFCODE DROP
+	TOS DPOP
+NEXT
+
+DEFCODE DUP
+	TOS DPUSH
+NEXT
+
+DEFCODE ?DUP
+	TOS TST
+	ZF CLEAR IF
+		TOSH TST
+		ZF CLEAR IF
+			TOS DPUSH
+		THEN
+	THEN
+NEXT
+
+DEFCODE SWAP
+	16 LDYW
+	TOS STYW
+	16 TOS MOVW
+NEXT
+
+DEFCODE OVER
+	16 LDYW
+	TOS DPUSH
+	16 TOS MOVW
+NEXT
+
+DEFCODE ROT
+	16 LDYW 	\ 2os
+	2 18 LDDYW 	\ 3os
+
+	2 16 STDYW	\ 2os -> 3os
+	TOS STYW	\ tos -> 2os
+	18 TOS MOVW	\ 3os -> tos
+NEXT
+
+DEFCODE -ROT
+	16 LDYW 	\ 2os
+	2 18 LDDYW 	\ 3os
+			\ 16 is tos
+			
+	2 TOS STDYW	\ tos -> 3os
+	18 STYW	\ 3os -> 2os
+	16 TOS MOVW	\ 2os -> tos
+NEXT
+
+DEFCODE 1+
+	1 TOS ADIW
+NEXT
+DEFCODE 1-
+	1 TOS SBIW
+NEXT
+
+DEFCODE 2+
+	2 TOS ADIW
+NEXT
+DEFCODE 2-
+	2 TOS SBIW
+NEXT
+
+DEFCODE +
+	16 DPOP
+	16 TOS ADD
+	17 TOSH ADC
+NEXT
+DEFCODE -
+	16 DPOP
+	TOS 16 SUB
+	TOSH 17 SBC
+	16 TOS MOVW
+NEXT
+
+DEFCODE 2*
+	TOS LSL
+	TOSH ROL
+NEXT
+DEFCODE 2/
+	TOSH ASR
+	TOS ROR
+NEXT
+DEFCODE U2/
+	TOSH LSR
+	TOS ROR
+NEXT
+
+\ mul and div can wait
+
+: CMP
+	16 DPOP
+
+	16 TOS CP
+	17 TOSH CPC
+
+	0 TOSH LDI 	\ CLR clobbers flags because it's secretly xor in a funny hat
+	0 TOS LDI
+;
+: RCMP
+	16 DPOP
+
+	TOS 16 CP
+	TOSH 17 CPC
+
+	0 TOSH LDI 	\ CLR clobbers flags because it's secretly xor in a funny hat
+	0 TOS LDI
+;
+
+DEFCODE =
+	CMP
+
+	ZF SET IF 	\ eq
+		1 TOS LDI
+	THEN
+NEXT
+DEFCODE <>
+	CMP
+
+	ZF CLEAR IF 	\ eq
+		1 TOS LDI
+	THEN
+NEXT
+
+DEFCODE <
+	RCMP
+
+	SF SET IF
+		1 TOS LDI
+	THEN
+NEXT
+DEFCODE >
+	CMP
+
+	SF SET IF
+		1 TOS LDI
+	THEN
+NEXT
+
+DEFCODE <=
+	CMP
+
+	SF CLEAR IF
+		1 TOS LDI
+	THEN
+NEXT
+DEFCODE >=
+	RCMP
+
+	SF CLEAR IF
+		1 TOS LDI
+	THEN
+NEXT
+
+DEFCODE EXIT
+	X POP
+	XH POP
+NEXT
+
+DEFCODE LIT
+	TOS LDX+
+	TOSH LDX+
+NEXT
+DEFCODE CLIT \ hoo hoo
+	TOS LDX+
+	TOSH CLR
+NEXT
+
+DEFCODE !
+	TOS Z MOVW
+	TOS DPOP
+	TOS STZW
+	TOS DPOP
+NEXT
+DEFCODE @
+	TOS Z MOVW
+	TOS LDZW
+NEXT
+
+DEFCODE +!
+	TOS Z MOVW
+	TOS DPOP
+	16 LDZW
+	16 TOS ADD
+	17 TOSH ADC
+	TOS STZW
+	TOS DPOP
+NEXT
+DEFCODE -!
+	TOS Z MOVW
+	TOS DPOP
+	16 LDZW
+	TOS 16 SUB
+	TOSH 17 SBC
+	16 STZW
+	TOS DPOP
+NEXT
+
+DEFCODE C!
+	TOS Z MOVW
+	TOS LDY		\ pop only low byte - saves a couple cycles
+	2 Y ADIW
+	TOS STZ
+	TOS DPOP
+NEXT
+DEFCODE C@
+	TOS Z MOVW
+	TOS LDZ
+	TOSH CLR
+NEXT
+
+DEFCODE OUT	\ store byte to immediate reg/io address
+	Z LDX+
+	0 ZH LDI
+	TOS STZ
+	TOS DPOP
+NEXT
+DEFCODE IN	\ load byte from immediate reg/io address
+	Z LDX+
+	0 ZH LDI
+	TOS DPUSH
+	TOS LDZ
+	0 TOSH LDI
+NEXT
+
+
+
+
+FINISH

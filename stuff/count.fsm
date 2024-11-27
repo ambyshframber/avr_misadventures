@@ -1,0 +1,91 @@
+LOAD ../m328P.def
+
+0 B,
+
+DECIMAL
+
+: SPI_INIT
+	{ BIN 00101100 DEC } 16 LDI \ set SCK, MOSI and /SS as outputs
+	16 DDRB OUT
+
+	{ BIN 01010010 DEC } 16 LDI \ config spi
+	16 SPCR OUT
+;
+
+: SPI_XFER
+	16 SPDR OUT
+	BEGIN
+		SPSR 16 IN
+		16 7 SET STBR
+	AGAIN
+	SPDR 16 IN
+;
+
+(
+	spin for 4N + 4 cycles, plus call overhead
+	4N + 7 for RCALL, 4N + 8 for CALL
+
+	1 cycle = 62.5ns at 16MHz
+		= 125ns at 8MHz
+	
+	4 cycles 	= 250ns at 16Mhz
+		 	= 500ns at 8Mhz
+)
+: SPIN
+	BEGIN
+		NOP
+		16 DEC
+	ZF SET UNTIL
+	NOP
+;
+(
+	spin for 1024N + 4 cycles, plus call overhead
+)
+: SPIN2
+	16 17 MOV
+	BEGIN
+		253 16 LDI
+		SPIN 
+		NOP
+		17 DEC
+	ZF SET UNTIL
+;
+(
+	spin for 262144N + 4 cycles, plus call overhead
+)
+: SPIN3
+	16 18 MOV
+	BEGIN
+		255 16 LDI \ 1
+		SPIN2 \ 0x3F004 cycles + 3 cycles
+
+		251 16 LDI \ 1
+		SPIN \ 4N + 4 + 3 cycles
+
+		NOP \ 1
+		18 DEC \ 1
+		
+		\ 16 + 0x3FC04 + 4N
+		\ = 3FC14
+		\ 4N = 1004
+	ZF SET UNTIL \ 2
+;
+
+: RESET
+	SPI_INIT
+	DDRD 2 SBI
+	0 17 LDI 
+
+	BEGIN
+		17 16 MOV
+		SPI_XFER
+		PORTD 2 SBI
+		PORTD 2 CBI
+		1 17 ADDI
+		255 19 LDI
+		SPIN2
+	AGAIN
+
+' RESET RESET!
+
+FINISH

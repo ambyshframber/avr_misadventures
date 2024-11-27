@@ -1,0 +1,1 @@
+sed "s/;.*//" | sed "s/#.*//" | sed -E /^\s*$/d | sed -E "s/\s*$//" | sed /^\.de/d | sed -E "s/.equ\s*(\w*)\s*= (0x)?(.*)$/\3 CONSTANT \1/"

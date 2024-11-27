@@ -1,0 +1,271 @@
+LOAD ../m328P.def
+
+0 B,
+
+DECIMAL
+
+LOAD delay.fsm
+
+{
+	: RCLK PORTD 2 ;
+	: RS PORTD 3 ;
+	: E PORTD 4 ;
+	: BL PORTD 5 ;
+}
+
+: SPI_INIT
+	{ BIN 00101100 DEC } DDRB OUTI \ set SCK, MOSI and /SS as outputs
+
+	{ BIN 01010000 DEC } SPCR OUTI
+;
+
+: SPI_TX_WAIT
+	16 SPDR OUT
+	BEGIN
+		SPSR 16 IN
+		16 7 SET STBR
+	AGAIN
+;
+
+: SR!
+	SPI_TX_WAIT
+	RCLK SBI
+	RCLK CBI
+;
+
+: UART_INIT
+	\ init uart to 9600 baud
+	103 UBRR0L STSI
+	0 UBRR0H STSI
+
+	{ 1 RXEN0 << 1 TXEN0 << OR } UCSR0B STSI
+;
+: UART_TX
+	BEGIN
+		UCSR0A 17 LDS
+		17 UDRE0 SET STBR
+	AGAIN
+
+	16 UDR0 STS
+;
+
+\ note: setup RS before calling
+: LCD!
+	SR!
+	{ 10 USEC DELAY }
+	E SBI
+	{ 30 USEC DELAY }
+	E CBI
+	{ 40 USEC DELAY }
+;
+
+: LCD_RESET
+	RS CBI
+
+	\ magic reset sequence
+	\ taking three as the number to reason about,
+	\ a convenient subject to state
+	B# 110000 16 LDI
+	LCD!
+	{ 4 MSEC 100 USEC + DELAY }
+
+	B# 110000 16 LDI
+	LCD!
+	{ 100 USEC DELAY }
+
+	B# 110000 16 LDI
+	LCD!
+	{ 100 USEC DELAY }
+
+	\ 8 bits, 2 lines, 5x11 dot font
+	B# 111100 16 LDI
+	LCD!
+	{ 100 USEC DELAY }
+
+	\ display on, cursor off
+	B# 1100 16 LDI
+	LCD!
+
+	\ clear display
+	B# 1 16 LDI
+	LCD!
+	{ 2 MSEC DELAY }
+
+	\ print left to right
+	B# 110 16 LDI
+	LCD!
+;
+
+: PM>X
+	BEGIN
+		17 LPM+
+		17 STX+
+		\UART_TX
+		16 DEC
+	ZF SET UNTIL
+;
+
+: X>LCD ( x: addr, 16: len -- )
+	16 17 MOV
+	RS SBI
+	BEGIN
+		16 LDX+
+		LCD!
+		17 DEC
+	ZF SET UNTIL
+;
+
+20 CONSTANT LINELEN
+(
+	IMPORTANT: the display buffer must not straddle a 256-byte boundary, ie. DISPLAYBUF % 256 must be less than 256 - (LINELEN * 3).
+)
+
+LINELEN 3 * RALLOT CONSTANT DISPLAYBUF
+{
+	RHERE @ H# FF AND LINELEN 3 * < IF ." display buffer straddles boundary" THEN
+}
+RVARIABLE LINEPOS
+
+: LCD_CR
+	\ set remainder of line to spaces
+	DISPLAYBUF LINELEN 2 * + X LDIW
+	LINEPOS 16 LDS
+	16 X ADD
+	32 17 LDI
+	BEGIN
+		17 STX+
+		16 INC
+		LINELEN 16 CPI
+	ZF SET UNTIL
+
+	\ clear display
+	RS CBI
+	B# 1 16 LDI
+	LCD!
+	{ 2000 USEC DELAY }
+
+	\ copy buffer line 0 to display line 0
+	LINELEN 16 LDI
+	DISPLAYBUF X LDIW \ index is 0
+	X>LCD
+
+	\ copy buffer line 2 to display line 2 (which is part of DDRAM line 0 (fuck this))
+	LINELEN 16 LDI
+	LINELEN X ADIW \ index is LINELEN * 2
+	X>LCD
+
+	\ copy buffer line 1 to display line 1 (DDRAM line 1)
+	LINELEN 16 LDI
+	LINELEN 2* X SBIW
+	X>LCD
+
+	\ shift display buffer by one line
+	DISPLAYBUF Y LDIW
+	LINELEN X SBIW \ index is LINELEN
+
+	LINELEN 2 * 16 LDI
+	BEGIN
+		17 LDX+
+		17 STY+
+		16 DEC
+	ZF SET UNTIL
+
+	0 LINEPOS STSI
+
+	RS CBI
+	{ B# 11000000 20 + } 16 LDI
+	LCD!
+;	
+
+: EMIT
+	16 18 MOV
+
+	'\r' 16 CPI
+	ZF SET IF RET THEN
+
+	'\n' 16 CPI
+	ZF SET IF
+		LCD_CR
+		RET
+	ELSE
+		LINEPOS 17 LDS
+		LINELEN 17 CPI
+		ZF SET IF
+			LCD_CR
+			0 17 LDI
+			18 16 MOV	
+		THEN
+	ETHEN
+
+	DISPLAYBUF LINELEN 2* + X LDIW
+	17 X ADD
+	16 STX
+
+	RS SBI
+	LCD!
+
+	17 INC
+	17 LINEPOS STS
+;
+
+: (.")
+	ZH POP
+	Z POP
+
+	Z LSL
+	ZH ROL
+
+	BEGIN
+		16 LPM+
+		16 TST
+	ZF CLEAR WHILE
+		EMIT
+	REPEAT
+
+	1 Z ADIW \ align to next multiple of 2
+	ZH LSR
+	Z ROR
+
+	IJMP
+
+: MESSAGE S" this is a test of the emergency broadcast system"
+CONSTANT MSGLEN
+
+: RESET
+	{ 40 MSEC DELAY }
+	SPI_INIT
+	UART_INIT
+
+	B# 1111100 DDRD OUTI
+
+	BL SBI
+	LCD_RESET
+
+	' MESSAGE LDIFZ
+	DISPLAYBUF X LDIW
+	MSGLEN 16 LDI
+	PM>X
+
+	{ MSGLEN LINELEN 2* - }
+	LINEPOS STSI
+
+	LCD_CR
+
+	(.")
+	Z" HELLORLD!"
+
+	'\n' 16 LDI
+	\EMIT
+
+	BEGIN
+		UCSR0A 16 LDS
+		16 RXC0 SET STBR
+		CONTINUE
+
+		UDR0 16 LDS
+		EMIT
+	AGAIN
+
+' RESET RESET!
+
+FINISH

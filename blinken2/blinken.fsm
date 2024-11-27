@@ -1,0 +1,352 @@
+LOAD ../m328P.def
+
+INT_VECTORS_SIZE BRESV
+
+DECIMAL
+
+(
+	REGISTER ALLOCATION ------------
+
+	r[2,3]		ISR scratch
+	r[4,5]		milliseconds since reset
+				little endian
+				do not access outside of lock except with MOVWs
+
+	r[22,23]	isr scratch
+
+	TIMER ALLOCATION ------------
+
+	t0	millisecond timer
+	t1	16-bit pwm
+)
+
+4 CONSTANT MILLIS
+5 CONSTANT MILLISH
+
+: OC0AISR
+	SREG 2 IN
+
+	MILLIS INC
+	ZF SET IF
+		MILLISH INC
+	THEN
+
+	2 SREG OUT
+I;
+' OC0AISR OC0Aaddr V!
+
+: INIT_T0
+	(
+		T0 is clocked at F_CPU / 64 (ie. 250khz) and resets every 250 clocks.
+		This creates F_OC0A at 1khz.
+	)
+	250 OCR0A OUTI		\ TOP = 250
+	B# 01000010 TCCR0A OUTI 	\ CTC mode, toggle OC0A on compare match
+	B# 11 TCCR0B OUTI 	\ F_CPU / 64
+	B# 10 TIMSK0 STSI 	\ send interrupts from compare match A to cpu
+;
+
+: INIT_T1
+	(
+		T1 is clocked at F_CPU / 8 and resets every 1024 clocks. This creates a PWM freqency of just under 2khz.
+	)
+	B# 10100011 TCCR1A STSI \ OC1A and B enabled, 10 bit phase correct PWM
+	B# 10 TCCR1B STSI 	\ F_CPU / 8
+;
+
+(
+: TDELAY
+	LOCK
+		MILLIS 16 ADD
+		MILLISH 17 ADC
+	UNLOCK
+
+	BEGIN
+		B# 1 18 LDI
+		18 SMCR OUTI
+		SLEEP
+
+		LOCK
+			MILLIS 16 CP
+			MILLISH 17 CPC
+		UNLOCK
+	ZF SET UNTIL
+;
+)
+
+(
+	struct channel {
+		u16 freq;
+		u16 phase;
+		u8 mode;
+		u8 output;
+		u16 iphase;
+		[u16; 4] params;
+	}
+
+	for non-pwm modes, output is a bitmask over port d
+	for pwm modes, output selects t1 pwm channel
+
+	MODES:
+		0	off
+		1	pulse wave
+			params[0] = pulse width
+
+
+	PWM CHANNELS
+
+	struct pwmchannel {
+		u16 freq;
+		u16 phase;
+		[u16; 6] params;
+	}
+
+	pwm channel 0 outputs to OC1A, 1 outputs to OC1B
+	both pwm channels have a lookup table in ram, generated at runtime
+)
+
+{
+	: STRUCT 0 ;
+	: FIELD DUP CONSTANT 1+ ;
+	: 2FIELD DUP CONSTANT 2 + ;
+	: ENDSTRUCT DROP ;
+
+	STRUCT
+		2FIELD FREQ
+		2FIELD PHASE
+		FIELD MODE
+		FIELD OUTPUT
+		2FIELD IPHASE
+		FIELD PARAMS
+	ENDSTRUCT
+
+	4 CONSTANT PWMPARAMS
+}
+
+16 CONSTANT CHAN_SIZE
+
+R: OUT_MODE0 ( y: &ch, [10,11]: phase )
+	PARAMS 8 LDDYW \ pulse width
+	OUTPUT 17 LDDY \ bitmask
+	PORTD 18 IN
+	
+	8 10 CP
+	9 11 CPC
+	\ cf set if pw > ph
+	CF SET IF
+		17 18 OR \ set outputs
+	ELSE
+		17 NEG 17 DEC
+		17 18 AND
+	ETHEN
+	18 PORTD OUT
+;
+
+BHERE @ CONSTANT BRIGHTNESS_LUT
+
+{
+	INCLUDELIB float.f
+	: GEN_BRIGHTNESS_LUT
+		0
+		BEGIN DUP 256 < WHILE
+			DUP DUP
+
+			\ first, generate x^2
+			I>X [ 256.0 ]X, XF/ 	\ map [0,256) to [0,1)
+			XFSQUARE
+
+			H# 80 < IF
+				XF2* XF2*
+			THEN
+
+			\ then, convert back to Q0.8
+			[ 256.0 ]X, XF* X>IT
+			\OVER HEX 2 U.R SPACE DUP 8 BIN U.R DEC CR
+			BC,
+
+			1+
+		REPEAT
+		DROP
+	;
+	GEN_BRIGHTNESS_LUT
+
+	: GEN_F_LUT ( ( X: f -- X: f ) -- )
+		0 BEGIN DUP 256 < WHILE
+			DUP
+			I>X [ 256.0 ]X, XF/ 	\ map [0,256) to [0,1)
+			OVER EXECUTE		\ map [0,1) to wherever
+			[ 256.0 ]X, XF* X>I	\ convert to Q0.8
+			255 MIN 0 MAX		\ clamp
+			BC,
+			1+
+		REPEAT
+		2DROP
+	;
+}
+
+(
+	RAM MAPPINGS
+
+	0	registers + io
+	100	sram start
+
+	4ff	stack top
+	500	ch0 lut
+	700	ch1 lut
+	8ff	ramtop
+)
+
+R: OUT_PWM ( [10,11]: phase, 16: is_ch1 )
+	\ generate index from phase
+	
+	10 LSL
+	11 ROL
+
+	11 Z MOV
+	5 ZH LDI
+	CF SET IF
+		ZH INC	\ 512 entries
+	THEN
+
+	\ if ch1, add 0x200 to index (ie. index ch1 lut)
+	16 0 0 STBR	\ skip if bit 0 of 16 is clear
+	2 ZH ADDI
+
+	\ get percieved brightness from ram lut
+	17 LDZ
+
+	\ now, curve to actual brightness with flash lut
+	BRIGHTNESS_LUT Z LDIW
+	17 Z ADD
+	CF SET IF
+		ZH INC
+	THEN
+	10 LPM
+	11 CLR
+	H# 7F 17 CPI
+	CF SET IF	\ see comment about the "mystery bitshift"
+		10 LSL
+		11 ROL
+		10 LSL
+		11 ROL
+	THEN
+
+	16 TST
+	ZF SET IF
+		10 OCR1AL STSW
+		RET
+	THEN
+	10 OCR1BL STSW
+;
+
+(
+	THE MYSTERY BITSHIFT EXPLAINED
+
+	TODO: ascii art diagram
+
+	We're using T1 for our PWM output, which means we have a choice of 8, 9, or 10-bit precision. Logically you'd think using anything more than 8 bits of precision would mean doubling the size of the lookup table, but with some cleverness we can get two more bits out of nowhere.
+
+	As discussed earlier, we get a percieved brightness from the lookup table in SRAM, then curve it to an actual brightness with a table in flash. The curve is x^2, because that's close enough. The top two bits of the first 128 entries are zero, which means we can shift them left 2 and get two bits of precision for free. It requires a bit more work at runtime to get 10 bit pwm everywhere (namely, shifting the other 128 entries left 2 after pulling them out of the table) but it's well worth it to stop things looking flickery.
+)
+
+$ CONSTANT OUT_JTABLE
+	OUT_MODE0
+
+: DO_CHAN ( y: &ch, 16: is_pwm -- [10,11]: phase )
+	(
+		i am somewhat optimistically assuming here that each cycle will complete in less than a millisecond. if this turns out to not be true, i guess we're fucked.
+		
+		PARAMS:
+			y	pointer to channel struct
+			16	[0,1] for pwms, -1 for bit
+
+		REGISTERS:
+			[8,9]	frequency
+			[10,11]	phase
+
+			clobbers z
+	)
+
+	FREQ 8 LDDYW
+	PHASE 10 LDDYW
+
+	8 10 ADD
+	9 11 ADC
+
+	PHASE 10 STDYW
+;
+
+
+
+
+1 CONSTANT #CHANNELS
+CHAN_SIZE #CHANNELS * RALLOT CONSTANT CHANNELS
+
+BHERE @ CONSTANT CH0_F \ BYTE ADDRESS
+
+3 BC, B# 0 BC, \ d3
+50 B,
+0 B,
+0 B,
+H# 1000 B,
+3 BRESV
+
+1 BC, B# 100 BC, \ d2
+107 B,
+0 B,
+0 B,
+H# 1000 B,
+3 BRESV
+
+: RECV
+	(
+		wait for interrupts in a loop
+	)
+;
+
+
+: PM>X
+	BEGIN
+		17 LPM+
+		17 STX+
+		16 DEC
+	ZF SET UNTIL
+;
+
+: RESET
+	\ init stack pointer
+	-1 SPL OUTI
+	4 SPH OUTI
+
+	B# 11111100 DDRD OUTI
+
+	B# 1111 DDRB OUTI
+
+	CH0_F Z LDIW
+	CHANNELS X LDIW
+	#CHANNELS CHAN_SIZE * 16 LDI
+	PM>X
+
+	INIT_T0
+	INIT_T1
+
+	GIF SEF
+
+	CHANNELS Y LDIW
+	BEGIN
+		PORTB 0 SBI
+		B# 1 SMCR OUTI
+		SLEEP
+		PORTB 0 CBI
+		
+		(
+			check if interrupt was rx or timer
+			if rx, stop updating lights while handling the command
+		)
+
+		DO_CHAN
+	AGAIN
+
+' RESET RESET!
+
+FINISH
